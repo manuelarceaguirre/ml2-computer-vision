@@ -1,5 +1,5 @@
 {
-  "description": "Explore lower distillation alpha: T=2 alpha=0.70 with baseline labeled/unlabeled KD weights.",
+  "description": "Continued-search baseline: current best T=2 alpha=0.70 labeled=0.50 unlabeled=1.00.",
   "recipe": "kd_b0_tta_eca160",
   "seeds": 3,
   "start_seed": 30,

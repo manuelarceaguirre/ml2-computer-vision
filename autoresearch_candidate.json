@@ -1,0 +1,18 @@
+{
+  "description": "Baseline autoresearch candidate: T=2 alpha=0.8, current strongest local KD objective on exploration folds/seeds.",
+  "recipe": "kd_b0_tta_eca160",
+  "seeds": 3,
+  "start_seed": 30,
+  "teacher_epochs": 10,
+  "checkpoint_epochs": [55, 65, 75],
+  "T": 2.0,
+  "alpha": 0.80,
+  "labeled": 0.50,
+  "unlabeled": 1.00,
+  "ttaavg": "logits",
+  "stress": true,
+  "scoring": {
+    "notes": "generalization_score = mean_val_acc + 0.20*stress_mean + 0.10*stress_worst - 0.03*max(0, cal_loss-1.20). Higher is better.",
+    "cal_loss_target": 1.20
+  }
+}

@@ -1,0 +1,3 @@
+- If starting a new exploration segment before finalization, test a global `augment=robust_light`/mild-geometry student augmentation for the current `kd_b0_tta_eca160` T=2 alpha=0.70 recipe: slightly more rotation/blur/JPEG than `basic`, but less aggressive than existing `robust`, validated only on exploration seeds first.
+- If there is substantial time, run a small architecture reconnaissance under the 500k parameter cap using defensible global students only; avoid large architecture search after locked confirmation unless restarting the protocol.
+- Use interpretability/confusion/saliency only as diagnostics to generate global hypotheses, not class-specific hacks or direct optimization targets.

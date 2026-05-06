@@ -916,7 +916,9 @@ def teacher_predict_logits(teacher: nn.Module, x: torch.Tensor, device: torch.de
         torch.clamp((x - 0.5) * 1.15 + 0.5, 0.0, 1.0),
         torch.clamp((x - 0.5) * 0.90 + 0.5, 0.0, 1.0),
     ]
-    return torch.stack([teacher(v) for v in views], dim=0).mean(dim=0)
+    batched = torch.cat(views, dim=0)
+    logits = teacher(batched).view(len(views), x.size(0), -1)
+    return logits.mean(dim=0)
 
 
 @torch.inference_mode()

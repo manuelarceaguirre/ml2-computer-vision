@@ -179,6 +179,19 @@ GRID = [
     ("E12_hybrid_finalist", "kd", with_teacher(base_student("grid_hybridse", dropout=0.20, augment="strong", lr=1e-3, wd=1e-3, epochs=DISTILL_EPOCHS, input_size=96), T=4.0, alpha=0.7, labeled=0.5, unlabeled=1.0)),
 ]
 
+only_raw = os.environ.get("GPTGRID_ONLY", "").strip()
+if only_raw:
+    requested = {x.strip() for x in only_raw.split(",") if x.strip()}
+    requested_names = {name for name, _kind, _cfg in GRID if name in requested}
+    unknown = sorted(requested - requested_names)
+    if unknown:
+        raise SystemExit(f"Unknown GPTGRID_ONLY experiments: {unknown}")
+    # KD experiments require fresh in-memory teacher logits. If a KD experiment is
+    # selected without E05, automatically prepend E05 in the same process.
+    if any(kind == "kd" and name in requested_names for name, kind, _cfg in GRID):
+        requested_names.add("E05_teacher_baseline")
+    GRID = [item for item in GRID if item[0] in requested_names]
+
 for _name, _kind, cfg in GRID:
     cfg["notes"] = f"GPT grid {_name}: sequential experiment queue run"
 

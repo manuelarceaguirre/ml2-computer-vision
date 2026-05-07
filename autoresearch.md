@@ -43,7 +43,7 @@ Interpretation: MaxViT is an excellent teacher but very sharp/overconfident, so 
 The benchmark still uses `autoresearch_eval.py`, which runs `experiment.run_kd_cv` and computes the robust scalar from validation accuracy, stress robustness, and calibrated loss.
 
 ## Current Baseline Candidate
-`autoresearch_candidate.json` is set to the first MaxViT transfer baseline for the overnight Mac run:
+`autoresearch_candidate.json` is set to the next MaxViT rescue candidate for the overnight Mac run:
 
 ```text
 teacher_model=maxvit_base_tf_384.in21k_ft_in1k
@@ -55,11 +55,12 @@ teacher_label_smoothing=0.0
 teacher_augment=basic
 teacher_tta=false
 student=plain_eca_head, head_ch=224, input_size=160
-T=4 alpha=0.50 labeled=0.50 unlabeled=1.00
+T=4 alpha=0.50 labeled=0.50 unlabeled=0.50
+epochs=45
 seeds=1 start_seed=30
 ```
 
-`seeds=1` is intentional for overnight triage on the Mac because MaxViT is expensive. Do not treat a one-seed result as final proof. Promote only substantial wins to multi-seed confirmation.
+This reflects the Colab grid result: `T=4 alpha=0.50 unlabeled=1.00` was the best MaxViT grid variant but still did not beat the B0 profile, and MaxViT runs peaked around epoch 45. The overnight candidate reduces unlabeled teacher pressure and stops near the observed peak. `seeds=1` is intentional for triage on the Mac because MaxViT is expensive. Do not treat a one-seed result as final proof. Promote only substantial wins to multi-seed confirmation.
 
 ## Search Space for Overnight
 Prefer one global change per iteration:

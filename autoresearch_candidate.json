@@ -1,5 +1,5 @@
 {
-  "description": "MaxViT transfer baseline: staged MaxViT teacher, no TTA, softened KD T=4 alpha=0.50, ECA160 student.",
+  "description": "MaxViT rescue candidate after Colab grid: T=4 alpha=0.50 with reduced unlabeled KD and 45-epoch horizon because MaxViT is sharp and prior runs peaked around epoch 45.",
   "recipe": "kd_b0_tta_eca160",
   "seeds": 1,
   "start_seed": 30,
@@ -17,7 +17,7 @@
   "head_ch": 224,
   "input_size": 160,
   "batch_size": 32,
-  "epochs": 75,
+  "epochs": 45,
   "lr": 0.001,
   "weight_decay": 0.0005,
   "dropout": 0.30,
@@ -25,11 +25,11 @@
   "T": 4.0,
   "alpha": 0.50,
   "labeled": 0.50,
-  "unlabeled": 1.00,
+  "unlabeled": 0.50,
   "normalize_kd": true,
   "stress": true,
   "scoring": {
-    "notes": "Exploration branch for MaxViT teacher transfer. Use seeds=1 overnight on Mac for candidate triage; confirm finalists later on multiple seeds. Do not tune on public LB.",
+    "notes": "Post-grid MaxViT rescue: reduce unlabeled teacher pressure and stop near observed best epoch. If this does not beat the B0/staged profile, abandon MaxViT transfer or switch to B0-staged search.",
     "cal_loss_target": 1.20
   }
 }

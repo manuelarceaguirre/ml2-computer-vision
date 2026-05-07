@@ -1,5 +1,5 @@
 {
-  "description": "MaxViT rescue candidate after Colab grid: T=4 alpha=0.50 with reduced unlabeled KD and 45-epoch horizon because MaxViT is sharp and prior runs peaked around epoch 45.",
+  "description": "MaxViT unlabeled-KD sweep: T=4 alpha=0.50 with intermediate unlabeled KD=0.75 to test whether more legal unlabeled teacher signal improves transfer without fully copying overconfident logits.",
   "recipe": "kd_b0_tta_eca160",
   "seeds": 1,
   "start_seed": 30,
@@ -25,11 +25,11 @@
   "T": 4.0,
   "alpha": 0.50,
   "labeled": 0.50,
-  "unlabeled": 0.50,
+  "unlabeled": 0.75,
   "normalize_kd": true,
   "stress": true,
   "scoring": {
-    "notes": "Post-grid MaxViT rescue: reduce unlabeled teacher pressure and stop near observed best epoch. If this does not beat the B0/staged profile, abandon MaxViT transfer or switch to B0-staged search.",
+    "notes": "Post-grid MaxViT rescue: sweep unlabeled teacher pressure around 0.50/0.75/1.00 while keeping the same staged teacher and 45-epoch horizon. This tests a broad global KD-transfer hypothesis, not class-specific tuning.",
     "cal_loss_target": 1.20
   }
 }

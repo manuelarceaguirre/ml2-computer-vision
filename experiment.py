@@ -1039,6 +1039,55 @@ def evaluate_stress(
     return stress
 
 
+def _teacher_head_param_ids(teacher: nn.Module) -> set:
+    """Best-effort classifier/head parameter identification across timm models."""
+    keywords = (".head", "head.", ".classifier", "classifier.", ".fc", "fc.")
+    ids = {id(p) for name, p in teacher.named_parameters() if any(k in name for k in keywords)}
+    # timm models usually expose get_classifier(); include it when available.
+    net = getattr(teacher, "net", teacher)
+    get_classifier = getattr(net, "get_classifier", None)
+    if callable(get_classifier):
+        try:
+            clf = get_classifier()
+            if isinstance(clf, nn.Module):
+                ids.update(id(p) for p in clf.parameters())
+        except Exception:
+            pass
+    return ids
+
+
+def _configure_teacher_optimizer(teacher: nn.Module, cfg: dict, *, head_only: bool, remaining_epochs: int) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.CosineAnnealingLR, str]:
+    head_ids = _teacher_head_param_ids(teacher)
+    if not head_ids:
+        # Fallback: do not accidentally freeze the whole teacher if a model has
+        # unusual classifier naming.
+        head_ids = {id(p) for p in teacher.parameters()}
+
+    for p in teacher.parameters():
+        p.requires_grad = (id(p) in head_ids) if head_only else True
+
+    wd = float(cfg.get("teacher_weight_decay", 1e-4))
+    if head_only:
+        lr = float(cfg.get("teacher_head_lr", cfg.get("teacher_lr", 3e-4)))
+        opt = torch.optim.AdamW([p for p in teacher.parameters() if p.requires_grad], lr=lr, weight_decay=wd)
+        phase = f"head_only lr={lr:g}"
+    else:
+        head_lr = float(cfg.get("teacher_head_lr", cfg.get("teacher_lr", 3e-4)))
+        backbone_lr = float(cfg.get("teacher_backbone_lr", cfg.get("teacher_lr", 3e-4)))
+        head_params, base_params = [], []
+        for p in teacher.parameters():
+            (head_params if id(p) in head_ids else base_params).append(p)
+        groups = []
+        if base_params:
+            groups.append({"params": base_params, "lr": backbone_lr})
+        if head_params:
+            groups.append({"params": head_params, "lr": head_lr})
+        opt = torch.optim.AdamW(groups, weight_decay=wd)
+        phase = f"full backbone_lr={backbone_lr:g} head_lr={head_lr:g}"
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, remaining_epochs), eta_min=float(cfg.get("min_lr", 1e-5)))
+    return opt, scheduler, phase
+
+
 def train_teacher_model(cfg: dict, train_idx: List[int], val_idx: List[int], device: torch.device) -> Tuple[nn.Module, dict]:
     set_seed(int(cfg["seed"]) + 777)
     teacher = build_teacher(cfg).to(device)
@@ -1047,22 +1096,26 @@ def train_teacher_model(cfg: dict, train_idx: List[int], val_idx: List[int], dev
     train_loader = DataLoader(train_ds, batch_size=int(cfg["teacher_batch_size"]), shuffle=True, num_workers=int(cfg.get("num_workers", 0)))
     val_loader = DataLoader(val_ds, batch_size=int(cfg["teacher_batch_size"]), shuffle=False, num_workers=int(cfg.get("num_workers", 0)))
 
-    opt = torch.optim.AdamW(teacher.parameters(), lr=float(cfg["teacher_lr"]), weight_decay=float(cfg["teacher_weight_decay"]))
     epochs = int(cfg["teacher_epochs"])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, epochs), eta_min=float(cfg.get("min_lr", 1e-5)))
+    warmup_epochs = int(cfg.get("teacher_head_warmup_epochs", 0) or 0)
+    opt, scheduler, phase = _configure_teacher_optimizer(teacher, cfg, head_only=warmup_epochs > 0, remaining_epochs=warmup_epochs if warmup_epochs > 0 else epochs)
+    print(f"teacher optimizer phase: {phase}")
     best_state = copy.deepcopy({k: v.detach().cpu() for k, v in teacher.state_dict().items()})
     best = {"teacher_best_val_acc": -1.0, "teacher_best_val_loss": float("inf"), "teacher_best_epoch": 0, "teacher_best_conf": None}
 
     for epoch in range(1, epochs + 1):
+        if warmup_epochs > 0 and epoch == warmup_epochs + 1:
+            opt, scheduler, phase = _configure_teacher_optimizer(teacher, cfg, head_only=False, remaining_epochs=epochs - warmup_epochs)
+            print(f"teacher optimizer phase: {phase}")
         teacher.train()
         loss_sum, correct, total = 0.0, 0, 0
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
             logits = teacher(x)
-            loss = F.cross_entropy(logits, y, label_smoothing=float(cfg.get("label_smoothing", 0.0)))
+            loss = F.cross_entropy(logits, y, label_smoothing=float(cfg.get("teacher_label_smoothing", cfg.get("label_smoothing", 0.0))))
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(teacher.parameters(), float(cfg.get("clip_grad_norm", 3.0)))
+            torch.nn.utils.clip_grad_norm_([p for p in teacher.parameters() if p.requires_grad], float(cfg.get("clip_grad_norm", 3.0)))
             opt.step()
             loss_sum += loss.item() * x.size(0)
             correct += (logits.argmax(1) == y).sum().item()
@@ -1072,9 +1125,11 @@ def train_teacher_model(cfg: dict, train_idx: List[int], val_idx: List[int], dev
         if (val_acc > best["teacher_best_val_acc"]) or (val_acc == best["teacher_best_val_acc"] and val_loss < best["teacher_best_val_loss"]):
             best_state = copy.deepcopy({k: v.detach().cpu() for k, v in teacher.state_dict().items()})
             best.update({"teacher_best_val_acc": val_acc, "teacher_best_val_loss": val_loss, "teacher_best_epoch": epoch, "teacher_best_conf": val_conf})
-        print(f"teacher epoch {epoch:03d}/{epochs} train_loss={loss_sum/total:.4f} train_acc={correct/total:.4f} val_loss={val_loss:.4f} val_acc={val_acc:.4f} conf={val_conf:.4f}")
+        print(f"teacher epoch {epoch:03d}/{epochs} phase={phase} train_loss={loss_sum/total:.4f} train_acc={correct/total:.4f} val_loss={val_loss:.4f} val_acc={val_acc:.4f} conf={val_conf:.4f}")
 
     teacher.load_state_dict(best_state)
+    for p in teacher.parameters():
+        p.requires_grad = True
     return teacher, best
 
 

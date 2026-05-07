@@ -285,6 +285,16 @@ def make_cfg(args: argparse.Namespace, teacher_name: str, seed: int) -> dict:
         cfg["teacher_tta"] = False
     if args.teacher_lr is not None:
         cfg["teacher_lr"] = float(args.teacher_lr)
+    if args.teacher_head_warmup_epochs:
+        cfg["teacher_head_warmup_epochs"] = int(args.teacher_head_warmup_epochs)
+    if args.teacher_head_lr is not None:
+        cfg["teacher_head_lr"] = float(args.teacher_head_lr)
+    if args.teacher_backbone_lr is not None:
+        cfg["teacher_backbone_lr"] = float(args.teacher_backbone_lr)
+    if args.teacher_label_smoothing is not None:
+        cfg["teacher_label_smoothing"] = float(args.teacher_label_smoothing)
+    if args.teacher_augment is not None:
+        cfg["teacher_augment"] = str(args.teacher_augment)
     return cfg
 
 
@@ -417,6 +427,11 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=int(os.environ.get("TEACHERGRID_BATCH_SIZE", "32")))
     parser.add_argument("--teacher-batch-size", type=int, default=int(os.environ.get("TEACHERGRID_TEACHER_BATCH_SIZE", "8")))
     parser.add_argument("--teacher-lr", type=float, default=None)
+    parser.add_argument("--teacher-head-warmup-epochs", type=int, default=int(os.environ.get("TEACHERGRID_HEAD_WARMUP_EPOCHS", "0")))
+    parser.add_argument("--teacher-head-lr", type=float, default=None)
+    parser.add_argument("--teacher-backbone-lr", type=float, default=None)
+    parser.add_argument("--teacher-label-smoothing", type=float, default=None)
+    parser.add_argument("--teacher-augment", default=None, help="Override teacher augmentation, e.g. basic,strong,none.")
     parser.add_argument("--num-workers", type=int, default=int(os.environ.get("TEACHERGRID_NUM_WORKERS", "0")))
     parser.add_argument("--quick", action="store_true", help="One-epoch smoke test, disables TTA.")
     parser.add_argument("--no-tta", action="store_true", help="Disable teacher TTA logit collection.")

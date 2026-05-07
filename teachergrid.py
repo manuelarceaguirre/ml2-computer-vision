@@ -355,7 +355,7 @@ def run_one_teacher(
     }, indent=2, sort_keys=True))
 
     model = None
-    if not args.no_distill:
+    if (not args.no_distill) and (not getattr(args, "committee_only", False)):
         print(f"Distilling fixed student from teacher={teacher_name} seed={seed}...")
         model, student_result = ex.train_kd_student_from_logits(
             cfg, f"teachergrid_{safe_name(teacher_name)}_s{seed}", train_idx, val_idx, labeled_logits, unlabeled_logits, device
@@ -437,6 +437,7 @@ def main() -> None:
     parser.add_argument("--no-tta", action="store_true", help="Disable teacher TTA logit collection.")
     parser.add_argument("--no-distill", action="store_true", help="Only compute teacher diagnostics/logits, do not train student.")
     parser.add_argument("--make-committee", action="store_true", help="After individual teachers, distill average-logit committee of all teachers in this run.")
+    parser.add_argument("--committee-only", action="store_true", help="With --make-committee, skip individual student distillation and distill only the averaged-logit committee.")
     parser.add_argument("--keep-going", action="store_true", default=os.environ.get("TEACHERGRID_KEEP_GOING", "1") == "1")
     parser.add_argument("--export-best", action="store_true", help="Reserved; teachergrid does not overwrite model.pt by default.")
     args = parser.parse_args()

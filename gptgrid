@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<'EOF'
+Usage: ./gptgrid
+
+Runs E01-E12 from the experiment queue sequentially. Results go to:
+  - gptgrid_results.json      cumulative JSON array
+  - gptgrid_results.jsonl     append-only JSONL
+  - log.txt                   existing project JSONL log
+
+Useful overrides:
+  GPTGRID_QUICK=1             one-epoch smoke run
+  GPTGRID_STUDENT_EPOCHS=80   supervised student epochs
+  GPTGRID_TEACHER_EPOCHS=30   teacher epochs
+  GPTGRID_DISTILL_EPOCHS=80   distilled student epochs
+  GPTGRID_BATCH_SIZE=64       student batch size
+  GPTGRID_THREADS=<n>         BLAS/PyTorch CPU threads
+  GPTGRID_EXPORT_BEST=0       do not overwrite model.pt with current best
+  GPTGRID_KEEP_GOING=0        stop at first failed experiment
+EOF
+  exit 0
+fi
+
+# Keep the Mac awake for the full sequential grid unless explicitly disabled.
+if command -v caffeinate >/dev/null 2>&1 && [[ "${GPTGRID_NO_CAFFEINATE:-0}" != "1" && "${GPTGRID_CAFFEINATED:-0}" != "1" ]]; then
+  export GPTGRID_CAFFEINATED=1
+  exec caffeinate -dimsu "$0" "$@"
+fi
+
+# Use the machine aggressively without running experiments in parallel.
+THREADS="${GPTGRID_THREADS:-$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 8)}"
+export OMP_NUM_THREADS="$THREADS"
+export MKL_NUM_THREADS="$THREADS"
+export OPENBLAS_NUM_THREADS="$THREADS"
+export VECLIB_MAXIMUM_THREADS="$THREADS"
+export NUMEXPR_NUM_THREADS="$THREADS"
+export PYTORCH_ENABLE_MPS_FALLBACK=1
+# Do not disable the MPS allocator high-water mark. Setting this to 0.0 can let
+# PyTorch consume enough unified memory to destabilize macOS under long runs.
+# Keep low < high so PyTorch can use adaptive commit / garbage collection before
+# the hard allocation cap is reached.
+export PYTORCH_MPS_HIGH_WATERMARK_RATIO="${PYTORCH_MPS_HIGH_WATERMARK_RATIO:-0.95}"
+export PYTORCH_MPS_LOW_WATERMARK_RATIO="${PYTORCH_MPS_LOW_WATERMARK_RATIO:-0.80}"
+export PYTHONUNBUFFERED=1
+
+python3 -m py_compile experiment.py
+
+python3 - <<'PY'
+from __future__ import annotations
+
+import copy
+import gc
+import json
+import os
+import time
+import traceback
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+
+import experiment as ex
+
+ROOT = Path(__file__).resolve().parent
+RESULTS = ROOT / "gptgrid_results.jsonl"
+RESULTS_JSON = ROOT / "gptgrid_results.json"
+LOG = ex.LOG_PATH
+MAX_PARAMS = 500_000
+QUICK = os.environ.get("GPTGRID_QUICK", "0") == "1"
+EXPORT_BEST = os.environ.get("GPTGRID_EXPORT_BEST", "1") != "0"
+RESUME = os.environ.get("GPTGRID_RESUME", "1") != "0"
+NUM_WORKERS = int(os.environ.get("GPTGRID_NUM_WORKERS", "0"))
+SEED = int(os.environ.get("GPTGRID_SEED", "42"))
+VAL_FRAC = float(os.environ.get("GPTGRID_VAL_FRAC", "0.20"))
+STUDENT_EPOCHS = int(os.environ.get("GPTGRID_STUDENT_EPOCHS", "80"))
+TEACHER_EPOCHS = int(os.environ.get("GPTGRID_TEACHER_EPOCHS", "30"))
+DISTILL_EPOCHS = int(os.environ.get("GPTGRID_DISTILL_EPOCHS", "80"))
+if QUICK:
+    STUDENT_EPOCHS = TEACHER_EPOCHS = DISTILL_EPOCHS = 1
+
+threads = int(os.environ.get("OMP_NUM_THREADS", "1"))
+torch.set_num_threads(max(1, threads))
+try:
+    torch.set_num_interop_threads(max(1, min(4, threads)))
+except RuntimeError:
+    pass
+
+
+def clean_cache() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
+
+
+def append_jsonl(path: Path, record: dict) -> None:
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def refresh_results_json() -> None:
+    if not RESULTS.exists():
+        return
+    rows = [json.loads(line) for line in RESULTS.read_text(encoding="utf-8").splitlines() if line.strip()]
+    RESULTS_JSON.write_text(json.dumps(rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def log_record(record: dict) -> None:
+    record = {"grid": "gptgrid", "time_unix": time.time(), **record}
+    append_jsonl(RESULTS, record)
+    refresh_results_json()
+    ex.append_log(record)
+
+
+def base_student(model: str, *, dropout: float, augment: str, lr: float, wd: float, epochs: int, input_size: int = 96, mixup: float = 0.0) -> dict:
+    return {
+        "seed": SEED,
+        "val_frac": VAL_FRAC,
+        "epochs": epochs,
+        "final_epochs": None,
+        "batch_size": int(os.environ.get("GPTGRID_BATCH_SIZE", "64")),
+        "input_size": input_size,
+        "lr": lr,
+        "min_lr": 1e-6,
+        "weight_decay": wd,
+        "label_smoothing": 0.05,
+        "mixup_alpha": mixup,
+        "clip_grad_norm": 5.0,
+        "num_workers": NUM_WORKERS,
+        "augment": augment,
+        "model": model,
+        "dropout": dropout,
+    }
+
+
+def with_teacher(cfg: dict, *, T: float = 4.0, alpha: float = 0.7, labeled: float = 0.5, unlabeled: float = 1.0, hard: float = 0.0, threshold: float = 0.90) -> dict:
+    out = copy.deepcopy(cfg)
+    out.update({
+        "teacher_model": "efficientnet_b0",
+        "teacher_epochs": TEACHER_EPOCHS,
+        "teacher_batch_size": int(os.environ.get("GPTGRID_TEACHER_BATCH_SIZE", "16")),
+        "teacher_input_size": "auto",
+        "teacher_lr": 3e-4,
+        "teacher_weight_decay": 1e-4,
+        "teacher_augment": "strong",
+        "teacher_tta": True,
+        "T": T,
+        "alpha": alpha,
+        "labeled_kd_weight": labeled,
+        "unlabeled_kd_weight": unlabeled,
+        "unlabeled_hard_weight": hard,
+        "unlabeled_conf_threshold": threshold,
+        "normalize_kd": True,
+    })
+    return out
+
+GRID = [
+    ("E01_supervised_baseline", "supervised", base_student("grid_simple", dropout=0.20, augment="basic", lr=1e-3, wd=1e-4, epochs=STUDENT_EPOCHS, input_size=96)),
+    ("E02_stronger_supervised", "supervised", base_student("grid_miniresnet", dropout=0.10, augment="strong", lr=1e-3, wd=1e-4, epochs=STUDENT_EPOCHS, input_size=96)),
+    ("E03_tiny_efficient", "supervised", base_student("grid_tinymobilenetv2", dropout=0.15, augment="strong", lr=2e-3, wd=1e-3, epochs=STUDENT_EPOCHS, input_size=96)),
+    ("E04_ds_baseline", "supervised", base_student("grid_dscnn", dropout=0.15, augment="strong", lr=2e-3, wd=1e-3, epochs=STUDENT_EPOCHS, input_size=96)),
+    ("E05_teacher_baseline", "teacher", with_teacher(base_student("grid_tinymobilenetv2", dropout=0.15, augment="strong", lr=2e-3, wd=1e-3, epochs=DISTILL_EPOCHS, input_size=96))),
+    ("E06_kd_labeled", "kd", with_teacher(base_student("grid_tinymobilenetv2", dropout=0.15, augment="strong", lr=2e-3, wd=1e-3, epochs=DISTILL_EPOCHS, input_size=96), T=2.0, alpha=0.5, labeled=1.0, unlabeled=0.0)),
+    ("E07_kd_stronger", "kd", with_teacher(base_student("grid_tinymobilenetv2", dropout=0.15, augment="strong", lr=2e-3, wd=1e-3, epochs=DISTILL_EPOCHS, input_size=96), T=4.0, alpha=0.7, labeled=1.0, unlabeled=0.0)),
+    ("E08_kd_high_t", "kd", with_teacher(base_student("grid_tinymobilenetv2", dropout=0.15, augment="strong", lr=2e-3, wd=1e-3, epochs=DISTILL_EPOCHS, input_size=96), T=8.0, alpha=0.7, labeled=1.0, unlabeled=0.0)),
+    ("E09_unlabeled_kd", "kd", with_teacher(base_student("grid_tinymobilenetv2", dropout=0.15, augment="strong", lr=2e-3, wd=1e-3, epochs=DISTILL_EPOCHS, input_size=96), T=4.0, alpha=0.7, labeled=0.5, unlabeled=1.0)),
+    ("E10_unlabeled_hard_pl", "kd", with_teacher(base_student("grid_tinymobilenetv2", dropout=0.15, augment="strong", lr=2e-3, wd=1e-3, epochs=DISTILL_EPOCHS, input_size=96), T=4.0, alpha=0.5, labeled=0.5, unlabeled=0.5, hard=0.5, threshold=0.90)),
+    ("E11_mixup_cutmix_kd", "kd", with_teacher(base_student("grid_tinymobilenetv2", dropout=0.15, augment="strong", lr=2e-3, wd=1e-3, epochs=DISTILL_EPOCHS, input_size=96, mixup=0.2), T=4.0, alpha=0.7, labeled=0.5, unlabeled=1.0)),
+    ("E12_hybrid_finalist", "kd", with_teacher(base_student("grid_hybridse", dropout=0.20, augment="strong", lr=1e-3, wd=1e-3, epochs=DISTILL_EPOCHS, input_size=96), T=4.0, alpha=0.7, labeled=0.5, unlabeled=1.0)),
+]
+
+for _name, _kind, cfg in GRID:
+    cfg["notes"] = f"GPT grid {_name}: sequential experiment queue run"
+
+completed_experiments = set()
+if RESUME and RESULTS.exists():
+    for line in RESULTS.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("status") == "ok" and row.get("experiment"):
+            completed_experiments.add(str(row["experiment"]))
+
+print(f"gptgrid starting: results={RESULTS_JSON} jsonl={RESULTS} log={LOG} quick={QUICK} resume={RESUME} threads={threads} workers={NUM_WORKERS}")
+device = ex.get_device()
+print(f"device={device}")
+
+# Fixed split for comparable one-after-another ablations.
+df = pd.read_csv(ex.DATA_ROOT / "labels.csv")
+train_idx, val_idx = ex.stratified_split(df["label"].tolist(), VAL_FRAC, SEED)
+
+best_model = None
+best_record = None
+shared_teacher = None
+shared_teacher_result = None
+shared_labeled_logits = None
+shared_unlabeled_logits = None
+shared_pseudo_counts = None
+shared_pseudo_conf = None
+
+for name, kind, cfg in GRID:
+    if name in completed_experiments:
+        print(f"\n=== {name} ({kind}) already completed; skipping due to GPTGRID_RESUME=1 ===")
+        continue
+    print(f"\n=== {name} ({kind}) ===")
+    start = time.time()
+    try:
+        params = ex.count_params(ex.build_model(cfg))
+        if params >= MAX_PARAMS:
+            raise RuntimeError(f"student params over cap: {params}")
+
+        if kind == "supervised":
+            model, result = ex.fit(cfg, recipe=name, train_all=False, epochs=int(cfg["epochs"]), device=device, split_indices=(train_idx, val_idx))
+            record = {"type": "gptgrid_run", "experiment": name, "kind": kind, "device": str(device), "config": cfg, **result}
+
+        elif kind == "teacher":
+            shared_teacher, shared_teacher_result = ex.train_teacher_model(cfg, train_idx, val_idx, device)
+            use_tta = bool(cfg.get("teacher_tta", False))
+            print("Collecting shared teacher logits for labeled and unlabeled images...")
+            shared_labeled_logits = ex.collect_labeled_logits(shared_teacher, device, batch_size=int(cfg["teacher_batch_size"]), use_tta=use_tta)
+            shared_unlabeled_logits = ex.collect_unlabeled_logits(shared_teacher, device, batch_size=int(cfg["teacher_batch_size"]), use_tta=use_tta)
+            probs = F.softmax(shared_unlabeled_logits, dim=1)
+            shared_pseudo_counts = torch.bincount(probs.argmax(1), minlength=ex.NUM_CLASSES).tolist()
+            shared_pseudo_conf = float(probs.max(1).values.mean().item())
+            record = {"type": "gptgrid_teacher_run", "experiment": name, "kind": kind, "device": str(device), "config": cfg, "n_train": len(train_idx), "n_val": len(val_idx), **shared_teacher_result, "unlabeled_pseudo_counts": shared_pseudo_counts, "unlabeled_mean_teacher_conf": shared_pseudo_conf}
+            model = None
+
+        elif kind == "kd":
+            if shared_labeled_logits is None or shared_unlabeled_logits is None or shared_teacher_result is None:
+                raise RuntimeError("E05 teacher logits are missing; teacher experiment must run before KD experiments")
+            model, result = ex.train_kd_student_from_logits(cfg, name, train_idx, val_idx, shared_labeled_logits, shared_unlabeled_logits, device)
+            record = {"type": "gptgrid_run", "experiment": name, "kind": kind, "device": str(device), "config": cfg, **shared_teacher_result, **result, "unlabeled_pseudo_counts": shared_pseudo_counts, "unlabeled_mean_teacher_conf": shared_pseudo_conf}
+
+        else:
+            raise RuntimeError(f"unknown kind: {kind}")
+
+        record["status"] = "ok"
+        record["elapsed_sec"] = round(time.time() - start, 3)
+        log_record(record)
+
+        if model is not None and record.get("best_val_acc") is not None:
+            key = (float(record["best_val_acc"]), -float(record["best_val_loss"]), float(record.get("stress_mean_acc") or 0.0))
+            old_key = None if best_record is None else (float(best_record["best_val_acc"]), -float(best_record["best_val_loss"]), float(best_record.get("stress_mean_acc") or 0.0))
+            if old_key is None or key > old_key:
+                best_record = record
+                best_model = copy.deepcopy(model).cpu()
+                if EXPORT_BEST:
+                    ex.export_torchscript(best_model, ex.MODEL_PATH)
+                    log_record({"type": "gptgrid_best_export", "experiment": name, "model_path": str(ex.MODEL_PATH), "params": int(record["params"]), "best_val_acc": record["best_val_acc"], "best_val_loss": record["best_val_loss"], "stress_mean_acc": record.get("stress_mean_acc"), "stress_worst_acc": record.get("stress_worst_acc")})
+                    print(f"exported current best to {ex.MODEL_PATH}")
+            del model
+
+    except Exception as e:
+        err = {"type": "gptgrid_run", "experiment": name, "kind": kind, "status": "crash", "elapsed_sec": round(time.time() - start, 3), "error": repr(e), "traceback": traceback.format_exc(), "config": cfg}
+        log_record(err)
+        print(err["traceback"])
+        if os.environ.get("GPTGRID_KEEP_GOING", "1") != "1":
+            raise
+    finally:
+        clean_cache()
+
+summary = {
+    "type": "gptgrid_summary",
+    "status": "done",
+    "n_experiments": len(GRID),
+    "quick": QUICK,
+    "best_experiment": best_record.get("experiment") if best_record else None,
+    "best_val_acc": best_record.get("best_val_acc") if best_record else None,
+    "best_val_loss": best_record.get("best_val_loss") if best_record else None,
+    "stress_mean_acc": best_record.get("stress_mean_acc") if best_record else None,
+    "stress_worst_acc": best_record.get("stress_worst_acc") if best_record else None,
+    "model_path": str(ex.MODEL_PATH) if EXPORT_BEST and best_record else None,
+}
+log_record(summary)
+print("\nGPTGRID SUMMARY")
+print(json.dumps(summary, indent=2, sort_keys=True))
+print(f"Results written to {RESULTS_JSON}; appended to {RESULTS} and {LOG}")
+PY

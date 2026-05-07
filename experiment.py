@@ -724,6 +724,178 @@ class PlainCNNECAHead(nn.Module):
         return self.classifier(x)
 
 
+class GridConvBNAct(nn.Sequential):
+    """Flexible Conv-BN-SiLU block used by the GPT experiment-grid students."""
+
+    def __init__(self, cin: int, cout: int, k: int = 3, s: int = 1, p: Optional[int] = None, groups: int = 1, act: bool = True):
+        if p is None:
+            p = k // 2
+        layers: List[nn.Module] = [
+            nn.Conv2d(cin, cout, k, s, p, groups=groups, bias=False),
+            nn.BatchNorm2d(cout),
+        ]
+        if act:
+            layers.append(nn.SiLU(inplace=True))
+        super().__init__(*layers)
+
+
+class GridSimpleConvNet(nn.Module):
+    def __init__(self, num_classes: int = NUM_CLASSES, dropout: float = 0.20):
+        super().__init__()
+        self.features = nn.Sequential(
+            GridConvBNAct(3, 32),
+            GridConvBNAct(32, 64),
+            nn.MaxPool2d(2),
+            GridConvBNAct(64, 96),
+            nn.MaxPool2d(2),
+            GridConvBNAct(96, 128),
+            nn.MaxPool2d(2),
+            nn.Dropout2d(dropout),
+            GridConvBNAct(128, 160),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.head = nn.Sequential(nn.Flatten(), nn.Dropout(dropout), nn.Linear(160, num_classes))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.features(x))
+
+
+class GridBasicBlock(nn.Module):
+    def __init__(self, cin: int, cout: int, stride: int = 1, dropout: float = 0.0):
+        super().__init__()
+        self.conv1 = GridConvBNAct(cin, cout, 3, stride)
+        self.drop = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
+        self.conv2 = GridConvBNAct(cout, cout, 3, 1, act=False)
+        self.skip = nn.Identity() if cin == cout and stride == 1 else GridConvBNAct(cin, cout, 1, stride, p=0, act=False)
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.conv2(self.drop(self.conv1(x))) + self.skip(x))
+
+
+class GridMiniResNet(nn.Module):
+    def __init__(self, num_classes: int = NUM_CLASSES, dropout: float = 0.10):
+        super().__init__()
+        self.stem = GridConvBNAct(3, 24)
+        self.body = nn.Sequential(
+            GridBasicBlock(24, 24, 1, dropout),
+            GridBasicBlock(24, 48, 2, dropout),
+            GridBasicBlock(48, 80, 2, dropout),
+            GridBasicBlock(80, 112, 2, dropout),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.head = nn.Sequential(nn.Flatten(), nn.Dropout(dropout), nn.Linear(112, num_classes))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.body(self.stem(x)))
+
+
+class GridDSBlock(nn.Module):
+    def __init__(self, cin: int, cout: int, stride: int = 1, dropout: float = 0.0):
+        super().__init__()
+        self.block = nn.Sequential(
+            GridConvBNAct(cin, cin, 3, stride, groups=cin),
+            GridConvBNAct(cin, cout, 1, 1, p=0),
+            nn.Dropout2d(dropout) if dropout > 0 else nn.Identity(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class GridDepthwiseSeparableCNN(nn.Module):
+    def __init__(self, num_classes: int = NUM_CLASSES, dropout: float = 0.15):
+        super().__init__()
+        self.features = nn.Sequential(
+            GridConvBNAct(3, 32),
+            GridDSBlock(32, 64, 1, dropout),
+            GridDSBlock(64, 96, 2, dropout),
+            GridDSBlock(96, 128, 1, dropout),
+            GridDSBlock(128, 160, 2, dropout),
+            GridDSBlock(160, 192, 1, dropout),
+            GridDSBlock(192, 224, 2, dropout),
+            GridConvBNAct(224, 224, 1, 1, p=0),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.head = nn.Sequential(nn.Flatten(), nn.Dropout(dropout), nn.Linear(224, num_classes))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.features(x))
+
+
+class GridInvertedResidual(nn.Module):
+    def __init__(self, cin: int, cout: int, stride: int = 1, expand: int = 4, dropout: float = 0.0):
+        super().__init__()
+        hidden = int(round(cin * expand))
+        layers: List[nn.Module] = []
+        if expand != 1:
+            layers.append(GridConvBNAct(cin, hidden, 1, 1, p=0))
+        layers.extend([
+            GridConvBNAct(hidden, hidden, 3, stride, groups=hidden),
+            GridConvBNAct(hidden, cout, 1, 1, p=0, act=False),
+        ])
+        self.block = nn.Sequential(*layers)
+        self.use_residual = stride == 1 and cin == cout
+        self.drop = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.drop(self.block(x))
+        return x + y if self.use_residual else y
+
+
+class GridTinyMobileNetV2(nn.Module):
+    def __init__(self, num_classes: int = NUM_CLASSES, dropout: float = 0.15):
+        super().__init__()
+        layers: List[nn.Module] = [GridConvBNAct(3, 24)]
+        cfg = [(24, 24, 1, 2), (24, 32, 2, 4), (32, 32, 1, 4), (32, 48, 2, 4), (48, 48, 1, 4), (48, 64, 2, 4), (64, 64, 1, 4), (64, 96, 1, 4)]
+        for cin, cout, stride, expand in cfg:
+            layers.append(GridInvertedResidual(cin, cout, stride, expand, dropout))
+        layers.extend([GridConvBNAct(96, 192, 1, 1, p=0), nn.AdaptiveAvgPool2d(1)])
+        self.features = nn.Sequential(*layers)
+        self.head = nn.Sequential(nn.Flatten(), nn.Dropout(dropout), nn.Linear(192, num_classes))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.features(x))
+
+
+class GridSE(nn.Module):
+    def __init__(self, channels: int, reduction: int = 8):
+        super().__init__()
+        hidden = max(8, channels // reduction)
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, hidden, 1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, channels, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.gate(x)
+
+
+class GridHybridSEGapCNN(nn.Module):
+    def __init__(self, num_classes: int = NUM_CLASSES, dropout: float = 0.20):
+        super().__init__()
+        self.features = nn.Sequential(
+            GridConvBNAct(3, 32),
+            GridBasicBlock(32, 48, 2, dropout=0.05),
+            GridSE(48),
+            GridDSBlock(48, 96, 2, dropout=0.05),
+            GridInvertedResidual(96, 96, 1, expand=3, dropout=0.05),
+            GridSE(96),
+            GridDSBlock(96, 160, 2, dropout=0.05),
+            GridInvertedResidual(160, 160, 1, expand=3, dropout=0.05),
+            GridSE(160),
+            GridConvBNAct(160, 224, 1, p=0),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.head = nn.Sequential(nn.Flatten(), nn.LayerNorm(224), nn.Dropout(dropout), nn.Linear(224, num_classes))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.features(x))
+
+
 def build_model(cfg: dict) -> nn.Module:
     name = cfg["model"]
     if name == "micro_mobilenet":
@@ -732,6 +904,16 @@ def build_model(cfg: dict) -> nn.Module:
         net = PlainCNN(dropout=float(cfg["dropout"]))
     elif name == "plain_eca_head":
         net = PlainCNNECAHead(dropout=float(cfg["dropout"]), head_ch=int(cfg.get("head_ch", 224)))
+    elif name == "grid_simple":
+        net = GridSimpleConvNet(dropout=float(cfg.get("dropout", 0.20)))
+    elif name == "grid_miniresnet":
+        net = GridMiniResNet(dropout=float(cfg.get("dropout", 0.10)))
+    elif name == "grid_dscnn":
+        net = GridDepthwiseSeparableCNN(dropout=float(cfg.get("dropout", 0.15)))
+    elif name == "grid_tinymobilenetv2":
+        net = GridTinyMobileNetV2(dropout=float(cfg.get("dropout", 0.15)))
+    elif name == "grid_hybridse":
+        net = GridHybridSEGapCNN(dropout=float(cfg.get("dropout", 0.20)))
     else:
         raise ValueError(f"unknown model: {name}")
     return Preprocess(net, size=int(cfg["input_size"]))
@@ -990,16 +1172,42 @@ def train_kd_epoch(
         t_lab = labeled_logits[idx_lab].to(device)
         t_un = unlabeled_logits[idx_un].to(device)
 
-        z_lab = student(x_lab)
+        mixup_alpha = float(cfg.get("mixup_alpha", 0.0) or 0.0)
+        if mixup_alpha > 0:
+            lam = float(np.random.beta(mixup_alpha, mixup_alpha))
+            perm = torch.randperm(x_lab.size(0), device=device)
+            x_lab_model = lam * x_lab + (1.0 - lam) * x_lab[perm]
+        else:
+            lam = 1.0
+            perm = None
+            x_lab_model = x_lab
+
+        z_lab = student(x_lab_model)
+        if perm is None:
+            ce = F.cross_entropy(z_lab, y_lab, label_smoothing=label_smoothing)
+            kd_lab = kd_loss(z_lab, t_lab, T)
+        else:
+            ce = lam * F.cross_entropy(z_lab, y_lab, label_smoothing=label_smoothing) + (1.0 - lam) * F.cross_entropy(z_lab, y_lab[perm], label_smoothing=label_smoothing)
+            kd_lab = lam * kd_loss(z_lab, t_lab, T) + (1.0 - lam) * kd_loss(z_lab, t_lab[perm], T)
+
         z_un = student(x_un)
-        ce = F.cross_entropy(z_lab, y_lab, label_smoothing=label_smoothing)
-        kd_lab = kd_loss(z_lab, t_lab, T)
         kd_un = kd_loss(z_un, t_un, T)
         unlabeled_kd_weight = float(cfg.get("unlabeled_kd_weight", 1.0))
         kd = labeled_kd_weight * kd_lab + unlabeled_kd_weight * kd_un
         if bool(cfg.get("normalize_kd", False)):
             kd = kd / max(1e-8, labeled_kd_weight + unlabeled_kd_weight)
-        loss = (1.0 - alpha) * ce + alpha * kd
+
+        hard_pl_weight = float(cfg.get("unlabeled_hard_weight", 0.0) or 0.0)
+        hard_pl_loss = z_un.new_tensor(0.0)
+        if hard_pl_weight > 0:
+            probs_un = F.softmax(t_un, dim=1)
+            conf_un, pseudo_un = probs_un.max(dim=1)
+            threshold = float(cfg.get("unlabeled_conf_threshold", 0.90))
+            mask = conf_un >= threshold
+            if bool(mask.any().item()):
+                hard_pl_loss = F.cross_entropy(z_un[mask], pseudo_un[mask])
+
+        loss = (1.0 - alpha) * ce + alpha * kd + hard_pl_weight * hard_pl_loss
 
         opt.zero_grad(set_to_none=True)
         loss.backward()

@@ -327,6 +327,22 @@ def run_one_teacher(
         **teacher_fit,
         **diagnostics,
     }
+    # Checkpoint teacher diagnostics immediately. Distillation can take a long
+    # time, and this preserves the teacher-quality evidence if Colab disconnects
+    # or the student run is interrupted.
+    teacher_checkpoint = {**record, "type": "teachergrid_teacher_checkpoint", "elapsed_sec": round(time.time() - start, 3)}
+    log_record(teacher_checkpoint)
+    print("TEACHER DIAGNOSTIC CHECKPOINT")
+    print(json.dumps({
+        "teacher": teacher_name,
+        "seed": int(seed),
+        "teacher_val_acc": record.get("teacher_val_acc"),
+        "teacher_val_loss": record.get("teacher_val_loss"),
+        "teacher_top3_acc": record.get("teacher_top3_acc"),
+        "teacher_wrong_conf": record.get("teacher_wrong_conf"),
+        "teacher_diagnostic_score": record.get("teacher_diagnostic_score"),
+        "unlabeled_pseudo_counts": record.get("unlabeled_pseudo_counts"),
+    }, indent=2, sort_keys=True))
 
     model = None
     if not args.no_distill:

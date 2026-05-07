@@ -1,102 +1,112 @@
-# Autoresearch: ML2 CV Generalization Search
+# Autoresearch: ML2 CV MaxViT Transfer Search
 
 ## Objective
-Find a lightweight PyTorch image classifier recipe that generalizes beyond the public leaderboard for ML2 Assignment 2. The submitted model must stay under 500,000 parameters and accept `(B,3,256,256)` float images in `[0,1]`, returning `(B,7)` logits.
+Search whether the very strong staged MaxViT teacher can produce a better deployable student than the previous EfficientNet-B0 KD incumbent, without falling into public-leaderboard tuning.
 
-This session should search only broad, defensible changes to the student/distillation/training recipe. Do not optimize to the public leaderboard and do not use hidden test feedback.
+The submitted model must remain a single PyTorch student with strictly fewer than 500,000 parameters and accept `(B,3,256,256)` float images in `[0,1]`, returning `(B,7)` logits.
+
+## Current Pivot
+Teacher diagnostics on Colab showed:
+
+```text
+MaxViT teacher: maxvit_base_tf_384.in21k_ft_in1k
+staged fine-tune: 5 epoch head warmup, then full FT with backbone_lr=2e-5, head_lr=1e-3
+seed 30 val acc: 0.9221
+val loss: 0.3398-0.3956 depending run
+Top-3: ~0.987-1.000
+unlabeled pseudo counts: balanced
+```
+
+But the first MaxViT student using the old B0-tuned KD knobs did not beat the prior incumbent:
+
+```text
+T=2 alpha=0.70 labeled=0.50 unlabeled=1.00
+best val acc=0.6104
+best val loss=1.1946
+stress mean=0.5584
+stress worst=0.5065
+best epoch=45
+```
+
+Interpretation: MaxViT is an excellent teacher but very sharp/overconfident, so the student likely needs softer or less teacher-dominant KD.
 
 ## Metrics
-- **Primary**: `generalization_score` (unitless, higher is better) — robust scalar computed from paired validation accuracy, stress robustness, and calibrated loss.
+- **Primary**: `generalization_score` (higher is better)
 - **Secondary**:
-  - `mean_val_acc` — mean clean validation accuracy across split seeds.
-  - `cal_loss` — mean calibrated validation cross entropy.
-  - `stress_mean` — mean stress-test accuracy.
-  - `stress_worst` — worst stress-test accuracy averaged across seeds.
-  - `selected_epoch` — chosen checkpoint epoch.
-  - `tau` — median/geomean calibration temperature.
+  - `mean_val_acc`
+  - `cal_loss`
+  - `stress_mean`
+  - `stress_worst`
+  - `selected_epoch`
+  - `tau`
 
-## Generalization Protocol
-Use a three-tier protocol to avoid local overfitting:
+The benchmark still uses `autoresearch_eval.py`, which runs `experiment.run_kd_cv` and computes the robust scalar from validation accuracy, stress robustness, and calibrated loss.
 
-1. **Exploration seeds**: use `autoresearch_candidate.json` default seeds `30,31,32` for overnight autoresearch. These are optimization seeds, not final proof.
-2. **Locked confirmation seeds**: after autoresearch proposes top candidates, run only the incumbent and <=3 finalists on locked seeds `40,41,42,43,44` once.
-3. **Final training**: only after confirmation, train on all labeled data + legal unlabeled data with the fixed chosen recipe.
+## Current Baseline Candidate
+`autoresearch_candidate.json` is set to the first MaxViT transfer baseline for the overnight Mac run:
 
-A candidate is submit-worthy only if it passes confirmation gates:
+```text
+teacher_model=maxvit_base_tf_384.in21k_ft_in1k
+teacher_epochs=15
+teacher_head_warmup_epochs=5
+teacher_head_lr=1e-3
+teacher_backbone_lr=2e-5
+teacher_label_smoothing=0.0
+teacher_augment=basic
+teacher_tta=false
+student=plain_eca_head, head_ch=224, input_size=160
+T=4 alpha=0.50 labeled=0.50 unlabeled=1.00
+seeds=1 start_seed=30
+```
 
-- mean clean acc >= incumbent + 0.012
-- at least 4/5 confirmation seeds improve or tie
-- no seed drops by more than 0.025
-- stress mean >= incumbent - 0.005
-- stress worst >= incumbent - 0.015
-- calibrated NLL <= incumbent + 0.030
+`seeds=1` is intentional for overnight triage on the Mac because MaxViT is expensive. Do not treat a one-seed result as final proof. Promote only substantial wins to multi-seed confirmation.
 
-## How to Run
-`./autoresearch.sh`
+## Search Space for Overnight
+Prefer one global change per iteration:
 
-This reads `autoresearch_candidate.json`, runs a paired local KD sweep via `experiment.py`, computes metrics, prints `METRIC ...` lines, then restores `log.txt` so autoresearch commits are not polluted by benchmark logs.
+- KD softness/weight:
+  - `T`: 3, 4, 6
+  - `alpha`: 0.40, 0.50, 0.60, 0.70
+- Teacher signal weights:
+  - `labeled`: 0.50, 0.75, 1.00
+  - `unlabeled`: 0.50, 0.75, 1.00
+- Student architecture, only if KD settings do not win:
+  - `student_model=plain_eca_head` incumbent, `head_ch=224`
+  - `student_model=grid_hybridse`, `dropout=0.20`, `weight_decay=1e-3`
+  - `student_model=grid_tinymobilenetv2`, `lr=2e-3`, `weight_decay=1e-3`
+- Training horizon:
+  - `epochs`: 45, 55, 65, 75, because first MaxViT run peaked at epoch 45
+
+## What Not To Do
+- Do not use public leaderboard feedback.
+- Do not repeatedly run locked confirmation seeds.
+- Do not use hidden labels, outside labeled data, dataset-source hunting, or class-specific hacks.
+- Do not assume the 0.92 teacher means the default student recipe is good; validate student transfer.
+- Do not spend many iterations on EVA/ConvNeXtV2 for now: diagnostics showed they failed to adapt under staged fine-tuning.
+
+## Promotion Gates
+A one-seed MaxViT candidate is worth confirming only if it beats the B0/previous profile by a meaningful margin, for example:
+
+- `mean_val_acc >= 0.63` on seed 30, or
+- `stress_mean >= 0.59` with clean/loss near incumbent, or
+- `cal_loss <= 1.15` while clean accuracy does not regress.
+
+Final confirmation should restore multi-seed protocol:
+
+```text
+exploration: seed 30 single-seed triage
+candidate confirmation: seeds 30,31,32 or locked 40-44 versus incumbent
+final: all labeled data + legal unlabeled data with fixed recipe
+```
 
 ## Files in Scope
-- `autoresearch_candidate.json` — primary knob file for candidate configs. Prefer editing this over `experiment.py`.
-- `autoresearch_eval.py` — benchmark wrapper and scoring function.
-- `autoresearch.sh` — benchmark entrypoint.
-- `experiment.py` — only for general, non-class-specific recipe capabilities or bug fixes. Avoid broad rewrites during autoresearch.
-- `autoresearch.md` and `autoresearch.ideas.md` — session memory and backlog.
-
-## Off Limits
-- `model.pt` — preserve current submitted model unless a confirmed finalist wins.
-- `data/`, `data.zip`, assignment files, and hidden/public leaderboard feedback.
-- Public leaderboard submissions.
-- Dataset-source searching or outside labeled data.
-- Class-specific hacks based on inspected validation images.
-- Directly optimizing to class 1/class 4 audit findings. Use audits only as hypothesis generation.
-
-## Current Incumbent / Context
-Current submitted model:
-
-```text
-recipe: kd_b0_tta_eca160
-student epochs: 65
-teacher epochs: 10
-KD: T=4 alpha=0.8 labeled=0.5 unlabeled=1.0 logits TTA targets
-export tau: 1.95
-params: 493,651
-public/client: acc 0.5816, loss 1.2370
-```
-
-Most recent local stress-finalist result found a better local candidate:
-
-```text
-T=2 alpha=0.8 labeled=0.5 unlabeled=1.0 logits targets epoch=65
-mean val acc=0.5801
-cal loss=1.1954
-stress mean=0.5589
-stress worst=0.5195
-median tau=1.50
-```
-
-Image audit suggested the student under-transfers teacher semantics on falafel/mezze-like class 1 and atypical ramen/noodle class 4, but this must not be used for class-specific tuning. If acting on this, prefer global changes like labeled KD weight, crop context, or teacher-target transfer strength, validated across all classes/seeds.
-
-## Suggested Safe Search Space
-Prefer global KD/training variants:
-
-- `T`: 1.5, 2.0, 2.5, 3.0
-- `alpha`: 0.70, 0.75, 0.80, 0.85
-- `labeled`: 0.50, 0.75, 1.00
-- `unlabeled`: 0.50, 0.75, 1.00
-- checkpoint epochs: 55, 65, 75
-- possibly safer crop/context augmentation only if implemented globally and validated against stress/worst-class behavior.
-
-## What's Been Tried
-- Supervised-only was much worse than KD.
-- EfficientNet-B0 teacher is reliable; ConvNeXt teacher collapsed in current setup.
-- Calibration improves loss but not accuracy.
-- hflip inference TTA and checkpoint averaging did not give clean local gains.
-- Shared-teacher grid showed T=2/T=8 variants competitive; stress-finalist run favored T=2 epoch 65.
-- Image audit found teacher/student semantic transfer gaps, especially class 1 and class 4, but class-specific optimization is off limits.
+- `autoresearch_candidate.json` — primary knob file. Prefer editing this.
+- `autoresearch_eval.py` — now supports broad global candidate overrides for teacher/student/KD fields.
+- `experiment.py` — only for general training capability/bug fixes.
+- `maxvit_kdgrid.py` — manual Colab grid helper, not the overnight autoresearch entrypoint.
 
 ## Autoresearch Rules
-- Prefer one candidate row per experiment to keep attribution clean.
-- Keep only candidates that improve primary `generalization_score`; otherwise discard.
+- Keep only candidates that improve primary `generalization_score`.
 - On discard/crash, annotate `asi` with what failed and what to avoid repeating.
-- Do not run confirmation seeds repeatedly. Confirmation is a separate manual step after top candidates emerge.
+- Always include why the candidate addresses MaxViT overconfidence/student transfer.
+- Deferred promising ideas go to `autoresearch.ideas.md`.

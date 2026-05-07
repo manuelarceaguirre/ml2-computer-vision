@@ -62,6 +62,36 @@ def main() -> int:
     if "teacher_tta" in cfg:
         patched["teacher_tta"] = bool(cfg["teacher_tta"])
 
+    # Optional broad recipe overrides. These let autoresearch move from the
+    # original B0 recipe into the MaxViT-teacher branch without rewriting
+    # experiment.py for each candidate. Keep this list global/non-class-specific.
+    float_fields = [
+        "teacher_lr", "teacher_head_lr", "teacher_backbone_lr", "teacher_weight_decay",
+        "teacher_label_smoothing", "lr", "weight_decay", "dropout", "mixup_alpha",
+        "label_smoothing", "unlabeled_hard_weight", "unlabeled_conf_threshold",
+    ]
+    int_fields = [
+        "teacher_batch_size", "teacher_head_warmup_epochs", "batch_size",
+        "input_size", "head_ch",
+    ]
+    str_fields = ["teacher_model", "teacher_input_size", "teacher_augment", "augment", "model"]
+    bool_fields = ["normalize_kd"]
+    for key in float_fields:
+        if key in cfg:
+            patched[key] = float(cfg[key])
+    for key in int_fields:
+        if key in cfg:
+            patched[key] = int(cfg[key])
+    for key in str_fields:
+        if key in cfg:
+            patched[key] = str(cfg[key])
+    for key in bool_fields:
+        if key in cfg:
+            patched[key] = bool(cfg[key])
+    # More readable alias in candidate JSON.
+    if "student_model" in cfg:
+        patched["model"] = str(cfg["student_model"])
+
     before_lines = len(LOG.read_text(encoding="utf-8").splitlines()) if LOG.exists() else 0
     old_log = LOG.read_text(encoding="utf-8") if LOG.exists() else None
     try:
@@ -92,6 +122,8 @@ def main() -> int:
         "folds": folds,
         "student_epochs": student_epochs,
         "teacher_epochs": teacher_epochs,
+        "teacher_model": patched.get("teacher_model"),
+        "student_model": patched.get("model"),
         "T": patched.get("T"),
         "alpha": patched.get("alpha"),
         "labeled": patched.get("labeled_kd_weight"),

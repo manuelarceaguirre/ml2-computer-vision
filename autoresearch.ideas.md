@@ -1,3 +1,6 @@
+- For MaxViT transfer, test whether `epochs=45` or `55` improves robustness/loss because the first MaxViT T=2 alpha=0.70 run peaked at epoch 45 and degraded/plateaued later.
+- If MaxViT remains too sharp, try `T=6 alpha=0.40` and/or reduce `unlabeled=0.50` to avoid over-copying overconfident teacher logits.
+- If KD softness wins but clean accuracy stalls, test `student_model=grid_hybridse` with the same MaxViT logits; it may absorb high-level teacher structure differently from `plain_eca_head`.
 - If starting a new exploration segment before finalization, test a global `augment=robust_light`/mild-geometry student augmentation for the current `kd_b0_tta_eca160` T=2 alpha=0.70 recipe: slightly more rotation/blur/JPEG than `basic`, but less aggressive than existing `robust`, validated only on exploration seeds first.
 - If there is substantial time, run a small architecture reconnaissance under the 500k parameter cap using defensible global students only; avoid large architecture search after locked confirmation unless restarting the protocol.
 - Use interpretability/confusion/saliency only as diagnostics to generate global hypotheses, not class-specific hacks or direct optimization targets.

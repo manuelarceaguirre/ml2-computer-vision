@@ -26,9 +26,9 @@ def last_kd_summary(before_lines: int) -> dict:
         if not line.strip():
             continue
         rec = json.loads(line)
-        if rec.get("type") == "kd_cv_run":
+        if rec.get("type") in {"kd_cv_run", "kd_validation_run"}:
             return rec
-    raise RuntimeError("experiment.py did not append a kd_cv_run summary to log.txt")
+    raise RuntimeError("experiment.py did not append a KD summary to log.txt")
 
 
 def main() -> int:
@@ -96,7 +96,14 @@ def main() -> int:
     old_log = LOG.read_text(encoding="utf-8") if LOG.exists() else None
     try:
         experiment.RECIPES[recipe] = patched
-        experiment.run_kd_cv(recipe, folds=folds, epochs_override=student_epochs, teacher_epochs_override=teacher_epochs)
+        if folds <= 1:
+            # Single-seed triage uses the recipe's deterministic stratified split.
+            # experiment.run_kd_cv requires folds>=2; folds=1 makes the train
+            # split empty, so use split-validation KD and normalize the resulting
+            # kd_validation_run to the same metric interface below.
+            experiment.run_kd(recipe, export=False)
+        else:
+            experiment.run_kd_cv(recipe, folds=folds, epochs_override=student_epochs, teacher_epochs_override=teacher_epochs)
         summary = last_kd_summary(before_lines)
     finally:
         experiment.RECIPES[recipe] = original
@@ -106,12 +113,16 @@ def main() -> int:
         elif LOG.exists():
             LOG.unlink()
 
-    mean_val_acc = float(summary["mean_val_acc"])
-    cal_loss = float(summary.get("mean_val_loss", 0.0))
+    if summary.get("type") == "kd_validation_run":
+        mean_val_acc = float(summary["best_val_acc"])
+        cal_loss = float(summary.get("best_val_loss", 0.0))
+    else:
+        mean_val_acc = float(summary["mean_val_acc"])
+        cal_loss = float(summary.get("mean_val_loss", 0.0))
     stress_mean = float(summary.get("stress_mean_acc", 0.0))
     stress_worst = float(summary.get("stress_worst_acc", 0.0))
     fold_epochs = [float(r.get("best_epoch", student_epochs)) for r in summary.get("fold_records", []) if isinstance(r, dict)]
-    selected_epoch = float(statistics.median(fold_epochs)) if fold_epochs else float(student_epochs)
+    selected_epoch = float(statistics.median(fold_epochs)) if fold_epochs else float(summary.get("best_epoch", student_epochs))
     cal_target = float(cfg.get("scoring", {}).get("cal_loss_target", 1.20))
     generalization_score = mean_val_acc + 0.20 * stress_mean + 0.10 * stress_worst - 0.03 * max(0.0, cal_loss - cal_target)
 
